@@ -1,0 +1,762 @@
+import re
+import html
+from dataclasses import dataclass, asdict
+from typing import Dict, List, Optional, Tuple
+from urllib.parse import urljoin, urlparse
+
+import pandas as pd
+import requests
+import streamlit as st
+from bs4 import BeautifulSoup
+
+
+DEFAULT_TOMORROW_URL = "https://www.freesupertips.com/predictions/tomorrows-football-predictions/"
+DEFAULT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-GB,en;q=0.9",
+}
+
+JUNK_REASONING_LINES = {
+    "Reasoning",
+    "Reason for tip",
+    "PLACE BET",
+    "Bookie",
+    "Bet Tip",
+    "Sign Up",
+    "BET HERE",
+    "Claim Free Bets",
+}
+
+
+@dataclass
+class PreviewLink:
+    url: str
+    link_text: str
+    listing_time: str = ""
+    listing_match: str = ""
+
+
+@dataclass
+class TipRow:
+    date: str
+    time: str
+    match: str
+    market: str
+    market_type: str
+    selection: str
+    odds_when_tipped: str
+    odds_decimal_from_tip: Optional[float]
+    current_decimal_from_returns: Optional[float]
+    reasoning: str
+    url: str
+    status: str = "OK"
+
+
+def clean_space(value: str) -> str:
+    value = html.unescape(value or "")
+    value = value.replace("\xa0", " ")
+    value = re.sub(r"[ \t]+", " ", value)
+    value = re.sub(r"\n\s*\n+", "\n", value)
+    return value.strip()
+
+
+def normalise_url(url: str) -> str:
+    url = (url or "").strip()
+    if not url:
+        return ""
+    if not url.startswith(("http://", "https://")):
+        url = "https://www.freesupertips.com" + ("" if url.startswith("/") else "/") + url
+    return url
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_html(url: str) -> str:
+    response = requests.get(url, headers=DEFAULT_HEADERS, timeout=25)
+    response.raise_for_status()
+    return response.text
+
+
+def is_preview_url(href: str) -> bool:
+    if not href:
+        return False
+    path = urlparse(href).path.lower()
+    if "/predictions/" not in path:
+        return False
+    # Most match-preview pages use this slug pattern. This keeps category/nav links out.
+    if "predictions-betting-tips-match-previews" in path:
+        return True
+    return False
+
+
+def extract_time_from_text(text: str) -> str:
+    # Handles 23:00, 02:00 + 1, 00:00+1 etc.
+    match = re.search(r"\b(\d{1,2}:\d{2})(?:\s*\+\s*(\d+)|\+(\d+))?\b", text or "")
+    if not match:
+        return ""
+    base = match.group(1)
+    plus = match.group(2) or match.group(3)
+    return f"{base}+{plus}" if plus else base
+
+
+def guess_match_from_link_text(text: str) -> str:
+    text = clean_space(text)
+    if not text:
+        return ""
+    # Remove common timing/TV cruft from listing cards.
+    text = re.sub(r"\b\d+h\s*\d+m\b", "", text, flags=re.I)
+    text = re.sub(r"\b\d+\s*days?\b", "", text, flags=re.I)
+    text = re.sub(r"\b\d{1,2}:\d{2}(?:\s*\+\s*\d+|\+\d+)?\b", "", text)
+    text = re.sub(r"\b(BBC One|BBC Two|ITV|Sky Sports|TNT Sports|Premier Sports)\b", "", text, flags=re.I)
+    text = clean_space(text)
+    # Some cards omit "vs" visually, but the article itself will supply the proper match name.
+    return text
+
+
+def make_preview_link(listing_url: str, a) -> Optional[PreviewLink]:
+    absolute = urljoin(listing_url, a.get("href", ""))
+    if not is_preview_url(absolute):
+        return None
+    link_text = clean_space(a.get_text(" ", strip=True))
+    return PreviewLink(
+        url=absolute,
+        link_text=link_text,
+        listing_time=extract_time_from_text(link_text),
+        listing_match=guess_match_from_link_text(link_text),
+    )
+
+
+def is_plain_see_all_link(a) -> bool:
+    text = clean_space(a.get_text(" ", strip=True)).lower()
+    if text != "see all":
+        return False
+    href = (a.get("href") or "").lower()
+    # The desired league-section marker links to a league page, not to a match preview.
+    return "/predictions/" in href and "predictions-betting-tips-match-previews" not in href
+
+
+def is_end_of_main_preview_section(tag) -> bool:
+    text = clean_space(tag.get_text(" ", strip=True)).lower()
+    if not text:
+        return False
+    # The main league block usually ends with "See All {League} Predictions".
+    if tag.name == "a" and text.startswith("see all") and "prediction" in text and not is_plain_see_all_link(tag):
+        return True
+    # Fallback guardrails for when the footer link is missing or markup changes.
+    if "select league" in text:
+        return True
+    if "tomorrow’s football predictions faqs" in text or "tomorrow's football predictions faqs" in text:
+        return True
+    return False
+
+
+def extract_preview_links(listing_url: str, html_text: str) -> List[PreviewLink]:
+    soup = BeautifulSoup(html_text, "html.parser")
+    tags = soup.find_all(["a", "h1", "h2", "h3", "div", "section", "select"])
+
+    # The page has a "Next Up" carousel near the top containing many future previews.
+    # The actual tomorrow-listing block begins after a plain "See All" link under the
+    # current league header and ends before "See All {League} Predictions" / filters.
+    main_start_idx = None
+    for idx, tag in enumerate(tags):
+        if tag.name == "a" and is_plain_see_all_link(tag):
+            main_start_idx = idx + 1
+            break
+
+    search_tags = tags[main_start_idx:] if main_start_idx is not None else tags
+    seen = set()
+    links: List[PreviewLink] = []
+
+    for tag in search_tags:
+        if is_end_of_main_preview_section(tag):
+            break
+        if tag.name != "a" or not tag.get("href"):
+            continue
+        preview_link = make_preview_link(listing_url, tag)
+        if preview_link is None:
+            continue
+        if preview_link.url in seen:
+            continue
+        seen.add(preview_link.url)
+        links.append(preview_link)
+
+    # Fallback: if the scoped scrape finds nothing, use the broad scrape so the app
+    # still returns something rather than silently failing after a page layout change.
+    if not links:
+        for a in soup.find_all("a", href=True):
+            preview_link = make_preview_link(listing_url, a)
+            if preview_link is None or preview_link.url in seen:
+                continue
+            seen.add(preview_link.url)
+            links.append(preview_link)
+
+    return links
+
+
+def parse_fractional_odds(odds: str) -> Optional[float]:
+    text = clean_space(odds).lower()
+    if not text:
+        return None
+    if text in {"evs", "evens"}:
+        return 2.0
+    m = re.search(r"(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)", text)
+    if not m:
+        # If it is already decimal, preserve it.
+        m2 = re.search(r"\d+(?:\.\d+)?", text)
+        if m2:
+            try:
+                return round(float(m2.group(0)), 2)
+            except ValueError:
+                return None
+        return None
+    num, den = float(m.group(1)), float(m.group(2))
+    if den == 0:
+        return None
+    return round((num / den) + 1, 2)
+
+
+def parse_money(value: str) -> Optional[float]:
+    if not value:
+        return None
+    m = re.search(r"£\s*([\d,]+)(?:\s*\.\s*(\d{1,2}))?", value)
+    if not m:
+        return None
+    whole = m.group(1).replace(",", "")
+    decimals = m.group(2) or "00"
+    try:
+        return float(f"{whole}.{decimals}")
+    except ValueError:
+        return None
+
+
+def get_selected_stake(block) -> Optional[float]:
+    selected = block.select_one("select option[selected]")
+    if selected and selected.get("value"):
+        try:
+            return float(selected["value"])
+        except ValueError:
+            pass
+    # Fallback: infer from text like "£10 Returns".
+    text = clean_space(block.get_text(" ", strip=True))
+    m = re.search(r"£\s*(\d+(?:\.\d+)?)\s*Returns", text, flags=re.I)
+    if m:
+        try:
+            return float(m.group(1))
+        except ValueError:
+            return None
+    if "50p Returns" in text:
+        return 0.5
+    return None
+
+
+def get_return_decimal(block) -> Optional[float]:
+    stake = get_selected_stake(block)
+    if not stake:
+        return None
+    return_div = block.select_one(".BetGrid__returns")
+    if not return_div:
+        return None
+    returns = parse_money(return_div.get_text("", strip=True))
+    if returns is None:
+        return None
+    return round(returns / stake, 2)
+
+
+def extract_reasoning(block) -> str:
+    # The reasoning usually lives in a WYSIWYG div inside the hidden accordion.
+    candidates = block.select(".Html-module__wysiwyg")
+    if candidates:
+        text = candidates[0].get_text("\n", strip=True)
+    else:
+        # Conservative fallback: take the text after "Reason for tip" and before odds/bookie table.
+        text = block.get_text("\n", strip=True)
+        if "Reason for tip" in text:
+            text = text.split("Reason for tip", 1)[-1]
+        text = re.split(r"\d+\s*/\s*\d+\s*odds when tipped|PLACE BET|Bookie", text, maxsplit=1)[0]
+
+    lines = []
+    for line in clean_space(text).splitlines():
+        line = clean_space(line)
+        if not line:
+            continue
+        if line in JUNK_REASONING_LINES:
+            continue
+        lines.append(line)
+    return clean_space(" ".join(lines))
+
+
+def extract_match_metadata(soup: BeautifulSoup) -> Dict[str, str]:
+    h1 = soup.find("h1")
+    raw_title = clean_space(h1.get_text(" ", strip=True)) if h1 else ""
+    match_name = re.sub(r"\s+Predictions\s*$", "", raw_title, flags=re.I).strip()
+
+    page_text = soup.get_text("\n", strip=True)
+    lines = [clean_space(x) for x in page_text.splitlines() if clean_space(x)]
+
+    published = ""
+    kickoff_time = ""
+    date_label = ""
+    stadium = ""
+
+    for line in lines:
+        if line.lower().startswith("published on"):
+            published = line
+            break
+
+    # Look near the title for time/date/stadium. This is intentionally loose because the page markup may change.
+    start_idx = 0
+    if raw_title in lines:
+        start_idx = lines.index(raw_title)
+    window = lines[start_idx : start_idx + 25]
+    for idx, line in enumerate(window):
+        if not kickoff_time and re.fullmatch(r"\d{1,2}:\d{2}(?:\s*\+\s*\d+|\+\d+)?", line):
+            kickoff_time = line.replace(" ", "")
+            # Usually the next line is Today/Tomorrow/date and the one after that is the stadium.
+            if idx + 1 < len(window):
+                date_label = window[idx + 1]
+            if idx + 2 < len(window):
+                stadium = window[idx + 2]
+            break
+
+    return {
+        "match": match_name,
+        "published": published,
+        "time": kickoff_time,
+        "date": date_label,
+        "stadium": stadium,
+    }
+
+
+def classify_market(selection: str, index: int) -> str:
+    """Role/order within the preview article, not the filterable betting market."""
+    selection_l = selection.lower()
+    if index == 1:
+        return "Correct Score"
+    if re.search(r"\b\d+\s*-\s*\d+\b", selection):
+        return "Correct Score"
+    if "score anytime" in selection_l or "to score anytime" in selection_l or "goalscorer" in selection_l:
+        return "Goalscorer"
+    if index == 0:
+        return "Main Tip"
+    return "Other Tip"
+
+
+def split_match_teams(match_name: str) -> List[str]:
+    """Return likely team names from a fixture string such as 'Ghana vs Panama'."""
+    text = clean_space(match_name)
+    if not text:
+        return []
+    text = re.sub(r"\s+Predictions$", "", text, flags=re.I)
+    parts = re.split(r"\s+(?:vs?\.?|v)\s+", text, flags=re.I)
+    if len(parts) >= 2:
+        return [clean_space(x) for x in parts[:2] if clean_space(x)]
+    return []
+
+
+def strip_leading_team(selection: str, match_name: str) -> str:
+    """Remove the fixture team name from the start of a tip so team-specific tips can share buckets."""
+    selection_clean = clean_space(selection)
+    selection_l = selection_clean.lower()
+    for team in sorted(split_match_teams(match_name), key=len, reverse=True):
+        team_clean = clean_space(team)
+        team_l = team_clean.lower()
+        if selection_l == team_l:
+            return ""
+        for prefix in (team_l + " ", team_l + "-", team_l + " –", team_l + " —"):
+            if selection_l.startswith(prefix):
+                return clean_space(selection_clean[len(team_clean):].lstrip())
+    return selection_clean
+
+
+def classify_market_type(selection: str, match_name: str, index: int) -> str:
+    """Filterable market bucket. This deliberately strips team names where appropriate."""
+    selection_clean = clean_space(selection)
+    selection_l = selection_clean.lower()
+    stripped = clean_space(strip_leading_team(selection_clean, match_name))
+    stripped_l = stripped.lower().strip()
+
+    # Exact scorelines, e.g. England 2-0 or 2-1.
+    if re.search(r"\b\d+\s*-\s*\d+\b", selection_clean):
+        return "Correct Score"
+
+    # Team-neutral markets.
+    if selection_l in {"both teams to score", "btts", "yes - both teams to score"}:
+        return "Both Teams To Score"
+    if "both teams to score" in selection_l and not split_match_teams(match_name):
+        return "Both Teams To Score"
+    if re.search(r"\bover\s+2\.5\b", selection_l):
+        return "Over 2.5 Goals"
+    if re.search(r"\bunder\s+2\.5\b", selection_l):
+        return "Under 2.5 Goals"
+    if selection_l == "draw" or stripped_l == "draw":
+        return "Draw"
+
+    # Team-specific markets normalised into shared buckets.
+    if "both teams to score" in stripped_l and ("win" in stripped_l or stripped_l.startswith("and ")):
+        return "Team To Win & BTTS"
+    if "win to nil" in stripped_l or "to win to nil" in stripped_l:
+        return "Team To Win To Nil"
+    if stripped_l in {"to win", "win", "winner"}:
+        return "Team To Win"
+    if re.fullmatch(r"[+-]\d+(?:\.\d+)?", stripped_l):
+        return "Handicap"
+    if re.search(r"\b[+-]\d+(?:\.\d+)?\b", stripped_l) and len(stripped_l) <= 8:
+        return "Handicap"
+
+    # Player/scorer markets.
+    if "to score anytime" in selection_l or "score anytime" in selection_l:
+        return "Anytime Goalscorer"
+    if "to score or assist" in selection_l or "score or assist" in selection_l:
+        return "Player To Score Or Assist"
+    if "to be shown a card" in selection_l or "to be carded" in selection_l:
+        return "Player To Be Carded"
+    if "shots" in selection_l:
+        return "Player Shots"
+    if "fouls" in selection_l:
+        return "Player Fouls"
+
+    # Fall back to the article role if that is more helpful than 'Other'.
+    if index == 0:
+        return "Main Tip - Other"
+    if index == 1:
+        return "Correct Score"
+    return "Other"
+
+
+def get_export_odds(row: pd.Series, odds_source: str) -> str:
+    odds_col = "odds_when_tipped" if odds_source == "Odds when tipped" else "current_decimal_from_returns"
+    odds = row.get(odds_col, "")
+    if pd.isna(odds):
+        return ""
+    return clean_space(str(odds))
+
+
+def make_cms_line(row: pd.Series, odds_source: str) -> str:
+    match = clean_space(str(row.get("match", "")))
+    time = clean_space(str(row.get("time", "")))
+    selection = clean_space(str(row.get("selection", "")))
+    odds = get_export_odds(row, odds_source)
+    reasoning = clean_space(str(row.get("reasoning", "")))
+    left = clean_space(f"{match} {time}")
+    odds_text = f" at {odds}" if odds else ""
+    heading = clean_space(f"{left} - {selection}{odds_text}")
+    return clean_space(f"{heading}\n{reasoning}")
+
+
+def extract_tips_from_preview(url: str, html_text: str, listing: Optional[PreviewLink] = None) -> List[TipRow]:
+    soup = BeautifulSoup(html_text, "html.parser")
+    meta = extract_match_metadata(soup)
+
+    if listing:
+        if not meta["time"] and listing.listing_time:
+            meta["time"] = listing.listing_time
+        if not meta["match"] and listing.listing_match:
+            meta["match"] = listing.listing_match
+
+    blocks = soup.select(".IndividualTipPrediction")
+    rows: List[TipRow] = []
+
+    for idx, block in enumerate(blocks):
+        h4 = block.find("h4")
+        if not h4:
+            continue
+        selection = clean_space(h4.get_text(" ", strip=True))
+        if not selection:
+            continue
+
+        odds_el = block.select_one(".BetExpand__odds span")
+        odds_when_tipped = clean_space(odds_el.get_text(" ", strip=True)) if odds_el else ""
+        odds_decimal = parse_fractional_odds(odds_when_tipped)
+        current_decimal = get_return_decimal(block)
+        reasoning = extract_reasoning(block)
+
+        rows.append(
+            TipRow(
+                date=meta.get("date", ""),
+                time=meta.get("time", ""),
+                match=meta.get("match", ""),
+                market=classify_market(selection, idx),
+                market_type=classify_market_type(selection, meta.get("match", ""), idx),
+                selection=selection,
+                odds_when_tipped=odds_when_tipped,
+                odds_decimal_from_tip=odds_decimal,
+                current_decimal_from_returns=current_decimal,
+                reasoning=reasoning,
+                url=url,
+                status="OK" if reasoning else "Missing reasoning",
+            )
+        )
+
+    if not rows:
+        rows.append(
+            TipRow(
+                date=meta.get("date", ""),
+                time=meta.get("time", ""),
+                match=meta.get("match", ""),
+                market="",
+                market_type="",
+                selection="",
+                odds_when_tipped="",
+                odds_decimal_from_tip=None,
+                current_decimal_from_returns=None,
+                reasoning="",
+                url=url,
+                status="No tip blocks found",
+            )
+        )
+
+    return rows
+
+
+def rows_to_dataframe(rows: List[TipRow]) -> pd.DataFrame:
+    df = pd.DataFrame([asdict(row) for row in rows])
+    if df.empty:
+        return pd.DataFrame(
+            columns=[
+                "date",
+                "time",
+                "match",
+                "market",
+                "market_type",
+                "selection",
+                "odds_when_tipped",
+                "odds_decimal_from_tip",
+                "current_decimal_from_returns",
+                "reasoning",
+                "url",
+                "status",
+            ]
+        )
+    return df
+
+
+def make_tsv(df: pd.DataFrame, odds_source: str) -> str:
+    if df.empty:
+        return ""
+    odds_col = "odds_when_tipped" if odds_source == "Odds when tipped" else "current_decimal_from_returns"
+    export = df.copy()
+    export["odds"] = export[odds_col].fillna("")
+    cols = ["time", "match", "market_type", "selection", "odds", "reasoning", "url"]
+    export = export[cols].fillna("")
+    export = export.rename(columns={"market_type": "market"})
+    return export.to_csv(sep="\t", index=False, header=True)
+
+
+def make_cms_text(df: pd.DataFrame, odds_source: str) -> str:
+    if df.empty:
+        return ""
+    chunks = [make_cms_line(row, odds_source) for _, row in df.iterrows()]
+    return "\n\n".join([x for x in chunks if x])
+
+
+def render_readable_shortlist(df: pd.DataFrame, odds_source: str):
+    if df.empty:
+        st.info("No tips match the current filters.")
+        return
+    for idx, row in df.iterrows():
+        odds = get_export_odds(row, odds_source)
+        odds_text = f" at {odds}" if odds else ""
+        heading = f"**{row.get('match', '')} {row.get('time', '')} - {row.get('selection', '')}{odds_text}**"
+        st.markdown(heading)
+        st.caption(f"{row.get('market_type', '')} · {row.get('market', '')}")
+        st.write(row.get("reasoning", ""))
+        url = row.get("url", "")
+        if url:
+            st.markdown(f"[Open preview]({url})")
+        st.divider()
+
+
+def build_filtered_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    filtered = df.copy()
+    market_options = sorted([x for x in filtered["market_type"].dropna().unique().tolist() if x])
+    markets = st.sidebar.multiselect("Market type", market_options, default=market_options)
+    role_options = sorted([x for x in filtered["market"].dropna().unique().tolist() if x])
+    roles = st.sidebar.multiselect("Article role", role_options, default=role_options)
+    search = st.sidebar.text_input("Search fixture/selection/reasoning", "")
+    status_options = sorted([x for x in filtered["status"].dropna().unique().tolist() if x])
+    statuses = st.sidebar.multiselect("Status", status_options, default=status_options)
+
+    if markets:
+        filtered = filtered[filtered["market_type"].isin(markets)]
+    if roles:
+        filtered = filtered[filtered["market"].isin(roles)]
+    if statuses:
+        filtered = filtered[filtered["status"].isin(statuses)]
+    if search.strip():
+        needle = search.strip().lower()
+        haystack = (
+            filtered["match"].fillna("")
+            + " "
+            + filtered["selection"].fillna("")
+            + " "
+            + filtered["reasoning"].fillna("")
+        ).str.lower()
+        filtered = filtered[haystack.str.contains(re.escape(needle), na=False)]
+    return filtered
+
+
+def main():
+    st.set_page_config(page_title="Preview Tip Compiler", layout="wide")
+    st.title("Preview Tip Compiler")
+    st.caption("Pull preview tips into readable, market-filterable shortlists with CMS-ready copy blocks.")
+
+    with st.sidebar:
+        st.header("Input")
+        mode = st.radio("Source", ["Tomorrow page URL", "Specific preview URLs"], index=0)
+        max_previews = st.number_input("Max previews to fetch", min_value=1, max_value=100, value=30, step=1)
+        odds_source = st.radio("Export odds", ["Odds when tipped", "Current decimal from returns"], index=0)
+
+    links: List[PreviewLink] = []
+    errors: List[str] = []
+
+    if mode == "Tomorrow page URL":
+        listing_url = st.text_input("Tomorrow predictions URL", value=DEFAULT_TOMORROW_URL)
+        run = st.button("Fetch previews", type="primary")
+        if run:
+            try:
+                listing_html = fetch_html(normalise_url(listing_url))
+                links = extract_preview_links(normalise_url(listing_url), listing_html)[: int(max_previews)]
+                st.session_state["links"] = [asdict(x) for x in links]
+            except Exception as exc:
+                st.error(f"Could not fetch listing page: {exc}")
+                st.stop()
+        elif "links" in st.session_state:
+            links = [PreviewLink(**item) for item in st.session_state["links"]]
+
+    else:
+        urls_raw = st.text_area(
+            "Preview URLs, one per line",
+            value="https://www.freesupertips.com/predictions/ghana-vs-panama-predictions-betting-tips-match-previews/",
+            height=130,
+        )
+        run = st.button("Fetch previews", type="primary")
+        if run:
+            links = [PreviewLink(url=normalise_url(x), link_text="") for x in urls_raw.splitlines() if x.strip()]
+            links = links[: int(max_previews)]
+            st.session_state["links"] = [asdict(x) for x in links]
+        elif "links" in st.session_state:
+            links = [PreviewLink(**item) for item in st.session_state["links"]]
+
+    if not links:
+        st.info("Enter a URL and click **Fetch previews**.")
+        st.stop()
+
+    with st.expander(f"Preview links found ({len(links)})", expanded=False):
+        st.dataframe(pd.DataFrame([asdict(x) for x in links]), use_container_width=True)
+
+    rows: List[TipRow] = []
+    progress = st.progress(0, text="Fetching preview pages...")
+    for i, link in enumerate(links, start=1):
+        try:
+            preview_html = fetch_html(link.url)
+            rows.extend(extract_tips_from_preview(link.url, preview_html, listing=link))
+        except Exception as exc:
+            errors.append(f"{link.url}: {exc}")
+            rows.append(
+                TipRow(
+                    date="",
+                    time=link.listing_time,
+                    match=link.listing_match,
+                    market="",
+                    market_type="",
+                    selection="",
+                    odds_when_tipped="",
+                    odds_decimal_from_tip=None,
+                    current_decimal_from_returns=None,
+                    reasoning="",
+                    url=link.url,
+                    status=f"Fetch error: {exc}",
+                )
+            )
+        progress.progress(i / len(links), text=f"Fetched {i}/{len(links)} previews")
+    progress.empty()
+
+    df = rows_to_dataframe(rows)
+    st.session_state["compiled_df"] = df
+
+    ok_count = int((df["status"] == "OK").sum()) if not df.empty else 0
+    st.success(f"Extracted {ok_count} usable tips from {len(links)} preview pages.")
+    if errors:
+        with st.expander("Fetch errors", expanded=True):
+            for err in errors:
+                st.warning(err)
+
+    filtered = build_filtered_df(df)
+
+    st.subheader("Readable shortlist")
+    st.caption("Filtered tips are shown in the same basic shape as your notes/CMS copy: fixture, time, selection, odds and reasoning.")
+    with st.expander("Show readable filtered tips", expanded=True):
+        render_readable_shortlist(filtered, odds_source)
+
+    st.subheader("Select tips")
+    display_cols = [
+        "time",
+        "match",
+        "market_type",
+        "selection",
+        "odds_when_tipped",
+        "reasoning",
+        "url",
+        "status",
+        "market",
+        "date",
+        "odds_decimal_from_tip",
+        "current_decimal_from_returns",
+    ]
+    filtered = filtered[display_cols]
+    editable = filtered.copy()
+    editable.insert(0, "select", True)
+    edited = st.data_editor(
+        editable,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "select": st.column_config.CheckboxColumn("Select"),
+            "time": st.column_config.TextColumn("Time", width="small"),
+            "match": st.column_config.TextColumn("Fixture", width="medium"),
+            "market_type": st.column_config.TextColumn("Market type", width="medium"),
+            "selection": st.column_config.TextColumn("Selection", width="medium"),
+            "odds_when_tipped": st.column_config.TextColumn("Fractional odds", width="small"),
+            "reasoning": st.column_config.TextColumn("Reasoning", width="large"),
+            "url": st.column_config.LinkColumn("URL", width="medium"),
+            "status": st.column_config.TextColumn("Status", width="small"),
+            "market": st.column_config.TextColumn("Article role", width="small"),
+        },
+    )
+
+    selected = edited[edited["select"]].drop(columns=["select"])
+
+    st.subheader("Copy/export selected tips")
+    tsv = make_tsv(selected, odds_source)
+    cms_text = make_cms_text(selected, odds_source)
+
+    st.markdown("**CMS / notepad style**")
+    st.text_area("Copy this into notes/CMS", value=cms_text, height=320)
+
+    with st.expander("Google Sheets / TSV and CSV export", expanded=False):
+        st.text_area("Copy this into Sheets", value=tsv, height=220)
+        st.download_button(
+            "Download selected CSV",
+            data=selected.to_csv(index=False).encode("utf-8"),
+            file_name="preview_tips.csv",
+            mime="text/csv",
+        )
+
+    with st.expander("Debug notes"):
+        st.markdown(
+            """
+- This version expects preview pages to contain `.IndividualTipPrediction` blocks.
+- Article role is order-based, but Market type is normalised for filtering. For example, team-specific selections such as "Portugal and Both Teams To Score" are bucketed as "Team To Win & BTTS".
+- `Odds when tipped` comes from the visible odds label, e.g. `15/4 odds when tipped`.
+- `Current decimal from returns` is calculated from the selected return table stake when available.
+"""
+        )
+
+
+if __name__ == "__main__":
+    main()

@@ -7,6 +7,7 @@ from urllib.parse import urljoin, urlparse
 import pandas as pd
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from bs4 import BeautifulSoup
 
 
@@ -47,6 +48,7 @@ class TipRow:
     match: str
     market: str
     market_type: str
+    market_tags: str
     selection: str
     odds_when_tipped: str
     odds_decimal_from_tip: Optional[float]
@@ -382,14 +384,18 @@ def classify_market_type(selection: str, match_name: str, index: int) -> str:
     if re.search(r"\b\d+\s*-\s*\d+\b", selection_clean):
         return "Correct Score"
 
-    # Team-neutral markets.
+    has_fixture_team_prefix = bool(split_match_teams(match_name)) and stripped_l != selection_l
+
+    # Team-neutral markets. Only treat totals as pure totals if the selection is not
+    # prefixed by a fixture team, otherwise combined team-win markets would be hidden
+    # from the Team To Win filters.
     if selection_l in {"both teams to score", "btts", "yes - both teams to score"}:
         return "Both Teams To Score"
     if "both teams to score" in selection_l and not split_match_teams(match_name):
         return "Both Teams To Score"
-    if re.search(r"\bover\s+2\.5\b", selection_l):
+    if re.search(r"\bover\s+2\.5\b", selection_l) and not has_fixture_team_prefix:
         return "Over 2.5 Goals"
-    if re.search(r"\bunder\s+2\.5\b", selection_l):
+    if re.search(r"\bunder\s+2\.5\b", selection_l) and not has_fixture_team_prefix:
         return "Under 2.5 Goals"
     if selection_l == "draw" or stripped_l == "draw":
         return "Draw"
@@ -397,6 +403,8 @@ def classify_market_type(selection: str, match_name: str, index: int) -> str:
     # Team-specific markets normalised into shared buckets.
     if "both teams to score" in stripped_l and ("win" in stripped_l or stripped_l.startswith("and ")):
         return "Team To Win & BTTS"
+    if re.search(r"\bover\s+2\.5\b", stripped_l) and ("win" in stripped_l or stripped_l.startswith("and ")):
+        return "Team To Win & Over 2.5 Goals"
     if "win to nil" in stripped_l or "to win to nil" in stripped_l:
         return "Team To Win To Nil"
     if stripped_l in {"to win", "win", "winner"}:
@@ -424,6 +432,63 @@ def classify_market_type(selection: str, match_name: str, index: int) -> str:
     if index == 1:
         return "Correct Score"
     return "Other"
+
+
+def classify_market_tags(selection: str, match_name: str, index: int) -> List[str]:
+    """Return all filter buckets a tip should appear under.
+
+    Example: "Portugal and Both Teams To Score" should be visible under
+    Team To Win & BTTS, Team To Win and Both Teams To Score.
+    """
+    primary = classify_market_type(selection, match_name, index)
+    selection_clean = clean_space(selection)
+    selection_l = selection_clean.lower()
+    stripped = clean_space(strip_leading_team(selection_clean, match_name))
+    stripped_l = stripped.lower().strip()
+
+    tags: List[str] = []
+
+    def add(tag: str):
+        if tag and tag not in tags:
+            tags.append(tag)
+
+    add(primary)
+
+    has_team = bool(split_match_teams(match_name)) and stripped_l != selection_l
+    has_btts = "both teams to score" in selection_l or "btts" in selection_l
+    has_over_25 = bool(re.search(r"\bover\s+2\.5\b", selection_l))
+    has_under_25 = bool(re.search(r"\bunder\s+2\.5\b", selection_l))
+    has_win_to_nil = "win to nil" in stripped_l or "to win to nil" in stripped_l
+    looks_like_team_win = (
+        has_team
+        and not has_win_to_nil
+        and (
+            stripped_l in {"", "to win", "win", "winner"}
+            or stripped_l.startswith("and ")
+            or " to win" in stripped_l
+            or " win " in f" {stripped_l} "
+        )
+    )
+
+    if looks_like_team_win or has_win_to_nil:
+        add("Team To Win")
+    if has_btts:
+        add("Both Teams To Score")
+    if has_over_25:
+        add("Over 2.5 Goals")
+    if has_under_25:
+        add("Under 2.5 Goals")
+
+    if (looks_like_team_win or has_win_to_nil) and has_btts:
+        add("Team To Win & BTTS")
+    if (looks_like_team_win or has_win_to_nil) and has_over_25:
+        add("Team To Win & Over 2.5 Goals")
+
+    return tags
+
+
+def market_tags_to_text(tags: List[str]) -> str:
+    return "; ".join(tags)
 
 
 def get_export_odds(row: pd.Series, odds_source: str) -> str:
@@ -480,6 +545,7 @@ def extract_tips_from_preview(url: str, html_text: str, listing: Optional[Previe
                 match=meta.get("match", ""),
                 market=classify_market(selection, idx),
                 market_type=classify_market_type(selection, meta.get("match", ""), idx),
+                market_tags=market_tags_to_text(classify_market_tags(selection, meta.get("match", ""), idx)),
                 selection=selection,
                 odds_when_tipped=odds_when_tipped,
                 odds_decimal_from_tip=odds_decimal,
@@ -498,6 +564,7 @@ def extract_tips_from_preview(url: str, html_text: str, listing: Optional[Previe
                 match=meta.get("match", ""),
                 market="",
                 market_type="",
+                market_tags="",
                 selection="",
                 odds_when_tipped="",
                 odds_decimal_from_tip=None,
@@ -521,6 +588,7 @@ def rows_to_dataframe(rows: List[TipRow]) -> pd.DataFrame:
                 "match",
                 "market",
                 "market_type",
+                "market_tags",
                 "selection",
                 "odds_when_tipped",
                 "odds_decimal_from_tip",
@@ -552,28 +620,103 @@ def make_cms_text(df: pd.DataFrame, odds_source: str) -> str:
     return "\n\n".join([x for x in chunks if x])
 
 
-def render_readable_shortlist(df: pd.DataFrame, odds_source: str):
+def make_readable_shortlist_html(df: pd.DataFrame, odds_source: str) -> str:
     if df.empty:
-        st.info("No tips match the current filters.")
-        return
-    for idx, row in df.iterrows():
-        odds = get_export_odds(row, odds_source)
-        odds_text = f" at {odds}" if odds else ""
-        heading = f"**{row.get('match', '')} {row.get('time', '')} - {row.get('selection', '')}{odds_text}**"
-        st.markdown(heading)
-        st.caption(f"{row.get('market_type', '')} · {row.get('market', '')}")
-        st.write(row.get("reasoning", ""))
-        url = row.get("url", "")
-        if url:
-            st.markdown(f"[Open preview]({url})")
-        st.divider()
+        body = '<p class="muted">No tips match the current filters.</p>'
+    else:
+        cards = []
+        plain_chunks = []
+        for _, row in df.iterrows():
+            odds = get_export_odds(row, odds_source)
+            odds_text = f" at {odds}" if odds else ""
+            heading = clean_space(f"{row.get('match', '')} {row.get('time', '')} - {row.get('selection', '')}{odds_text}")
+            reasoning = clean_space(str(row.get("reasoning", "")))
+            meta = clean_space(f"{row.get('market_type', '')} · {row.get('market', '')}")
+            url = clean_space(str(row.get("url", "")))
+            plain_chunks.append(f"{heading}\n{reasoning}")
+            link = f'<a href="{html.escape(url)}" target="_blank" rel="noopener">Open preview</a>' if url else ""
+            cards.append(
+                '<article class="tip-card">'
+                f'<h3>{html.escape(heading)}</h3>'
+                f'<div class="meta">{html.escape(meta)}</div>'
+                f'<p>{html.escape(reasoning)}</p>'
+                f'{link}'
+                '</article>'
+            )
+        plain = html.escape("\n\n".join(plain_chunks))
+        body = f'<div id="copyText">{"".join(cards)}</div><textarea id="plainText" aria-label="plain text for copying">{plain}</textarea>'
+
+    return f'''
+    <html>
+    <head>
+      <style>
+        body {{ font-family: sans-serif; margin: 0; padding: 0 2px 12px 2px; color: #111827; }}
+        .toolbar {{ position: sticky; top: 0; background: white; padding: 0 0 10px 0; z-index: 2; }}
+        button {{ border: 1px solid #d1d5db; border-radius: 8px; padding: 8px 12px; background: #f9fafb; cursor: pointer; }}
+        button:hover {{ background: #f3f4f6; }}
+        .tip-card {{ border-bottom: 1px solid #e5e7eb; padding: 14px 0; user-select: text; }}
+        .tip-card h3 {{ font-size: 16px; line-height: 1.35; margin: 0 0 4px 0; font-weight: 700; }}
+        .tip-card .meta {{ color: #6b7280; font-size: 13px; margin-bottom: 8px; }}
+        .tip-card p {{ font-size: 15px; line-height: 1.5; margin: 0 0 8px 0; white-space: pre-wrap; }}
+        .tip-card a {{ color: #2563eb; font-size: 13px; }}
+        .muted {{ color: #6b7280; }}
+        #plainText {{ position: absolute; left: -9999px; top: -9999px; width: 1px; height: 1px; }}
+        @media (prefers-color-scheme: dark) {{
+          body {{ background: #0e1117; color: #f9fafb; }}
+          .toolbar {{ background: #0e1117; }}
+          button {{ background: #1f2937; color: #f9fafb; border-color: #374151; }}
+          button:hover {{ background: #374151; }}
+          .tip-card {{ border-bottom-color: #374151; }}
+          .tip-card .meta {{ color: #9ca3af; }}
+          .tip-card a {{ color: #93c5fd; }}
+        }}
+      </style>
+    </head>
+    <body>
+      <div class="toolbar"><button onclick="copyAll()">Copy all visible tips</button> <span id="copyStatus" class="muted"></span></div>
+      {body}
+      <script>
+        document.addEventListener('keydown', function(e) {{ e.stopPropagation(); }}, true);
+        document.addEventListener('copy', function(e) {{ e.stopPropagation(); }}, true);
+        async function copyAll() {{
+          const textEl = document.getElementById('plainText');
+          const status = document.getElementById('copyStatus');
+          if (!textEl) return;
+          try {{
+            await navigator.clipboard.writeText(textEl.value);
+            status.innerText = 'Copied';
+          }} catch (err) {{
+            textEl.style.position = 'fixed';
+            textEl.style.left = '8px';
+            textEl.style.top = '8px';
+            textEl.style.width = '95%';
+            textEl.style.height = '220px';
+            textEl.select();
+            status.innerText = 'Clipboard blocked. Press Ctrl+C now.';
+          }}
+        }}
+      </script>
+    </body>
+    </html>
+    '''
+
+
+def render_readable_shortlist(df: pd.DataFrame, odds_source: str):
+    height = min(900, max(260, 155 * max(1, len(df)) + 70))
+    components.html(make_readable_shortlist_html(df, odds_source), height=height, scrolling=True)
 
 
 def build_filtered_df(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     filtered = df.copy()
-    market_options = sorted([x for x in filtered["market_type"].dropna().unique().tolist() if x])
+    tag_values = []
+    for raw_tags in filtered.get("market_tags", pd.Series(dtype=str)).fillna(""):
+        for tag in str(raw_tags).split(";"):
+            tag = clean_space(tag)
+            if tag:
+                tag_values.append(tag)
+    market_options = sorted(set(tag_values))
     markets = st.sidebar.multiselect("Market type", market_options, default=market_options)
     role_options = sorted([x for x in filtered["market"].dropna().unique().tolist() if x])
     roles = st.sidebar.multiselect("Article role", role_options, default=role_options)
@@ -582,7 +725,12 @@ def build_filtered_df(df: pd.DataFrame) -> pd.DataFrame:
     statuses = st.sidebar.multiselect("Status", status_options, default=status_options)
 
     if markets:
-        filtered = filtered[filtered["market_type"].isin(markets)]
+        market_set = set(markets)
+        filtered = filtered[
+            filtered["market_tags"].fillna("").apply(
+                lambda raw: bool(market_set.intersection({clean_space(x) for x in str(raw).split(";") if clean_space(x)}))
+            )
+        ]
     if roles:
         filtered = filtered[filtered["market"].isin(roles)]
     if statuses:
@@ -664,6 +812,7 @@ def main():
                     match=link.listing_match,
                     market="",
                     market_type="",
+                    market_tags="",
                     selection="",
                     odds_when_tipped="",
                     odds_decimal_from_tip=None,
@@ -698,6 +847,7 @@ def main():
         "time",
         "match",
         "market_type",
+        "market_tags",
         "selection",
         "odds_when_tipped",
         "reasoning",
@@ -719,7 +869,8 @@ def main():
             "select": st.column_config.CheckboxColumn("Select"),
             "time": st.column_config.TextColumn("Time", width="small"),
             "match": st.column_config.TextColumn("Fixture", width="medium"),
-            "market_type": st.column_config.TextColumn("Market type", width="medium"),
+            "market_type": st.column_config.TextColumn("Primary market", width="medium"),
+            "market_tags": st.column_config.TextColumn("Filter buckets", width="medium"),
             "selection": st.column_config.TextColumn("Selection", width="medium"),
             "odds_when_tipped": st.column_config.TextColumn("Fractional odds", width="small"),
             "reasoning": st.column_config.TextColumn("Reasoning", width="large"),
@@ -751,7 +902,7 @@ def main():
         st.markdown(
             """
 - This version expects preview pages to contain `.IndividualTipPrediction` blocks.
-- Article role is order-based, but Market type is normalised for filtering. For example, team-specific selections such as "Portugal and Both Teams To Score" are bucketed as "Team To Win & BTTS".
+- Article role is order-based, but Market type is normalised for filtering. Combined tips also carry multiple filter buckets. For example, "Portugal and Both Teams To Score" appears under "Team To Win & BTTS", "Team To Win" and "Both Teams To Score".
 - `Odds when tipped` comes from the visible odds label, e.g. `15/4 odds when tipped`.
 - `Current decimal from returns` is calculated from the selected return table stake when available.
 """

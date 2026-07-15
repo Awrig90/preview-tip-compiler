@@ -1,5 +1,6 @@
 import re
 import html
+import json
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
@@ -635,12 +636,17 @@ def make_readable_shortlist_html(df: pd.DataFrame, odds_source: str) -> str:
             url = clean_space(str(row.get("url", "")))
             plain_chunks.append(f"{heading}\n{reasoning}")
             link = f'<a href="{html.escape(url)}" target="_blank" rel="noopener">Open preview</a>' if url else ""
+            reasoning_id = f"reasoning-{len(cards)}"
+            reasoning_json = html.escape(json.dumps(reasoning), quote=True)
             cards.append(
                 '<article class="tip-card">'
                 f'<h3>{html.escape(heading)}</h3>'
                 f'<div class="meta">{html.escape(meta)}</div>'
-                f'<p>{html.escape(reasoning)}</p>'
+                '<div class="card-actions">'
+                f'<button class="copy-reasoning" onclick="copyText({reasoning_json}, this)">Copy reasoning</button>'
                 f'{link}'
+                '</div>'
+                f'<p id="{reasoning_id}">{html.escape(reasoning)}</p>'
                 '</article>'
             )
         plain = html.escape("\n\n".join(plain_chunks))
@@ -657,8 +663,10 @@ def make_readable_shortlist_html(df: pd.DataFrame, odds_source: str) -> str:
         .tip-card {{ border-bottom: 1px solid #e5e7eb; padding: 14px 0; user-select: text; }}
         .tip-card h3 {{ font-size: 16px; line-height: 1.35; margin: 0 0 4px 0; font-weight: 700; }}
         .tip-card .meta {{ color: #6b7280; font-size: 13px; margin-bottom: 8px; }}
-        .tip-card p {{ font-size: 15px; line-height: 1.5; margin: 0 0 8px 0; white-space: pre-wrap; }}
+        .tip-card p {{ font-size: 15px; line-height: 1.5; margin: 8px 0 0 0; white-space: pre-wrap; }}
         .tip-card a {{ color: #2563eb; font-size: 13px; }}
+        .card-actions {{ display: flex; align-items: center; gap: 10px; margin: 7px 0 0 0; }}
+        .copy-reasoning {{ font-size: 13px; padding: 5px 9px; border-radius: 7px; }}
         .muted {{ color: #6b7280; }}
         #plainText {{ position: absolute; left: -9999px; top: -9999px; width: 1px; height: 1px; }}
         @media (prefers-color-scheme: dark) {{
@@ -678,14 +686,38 @@ def make_readable_shortlist_html(df: pd.DataFrame, odds_source: str) -> str:
       <script>
         document.addEventListener('keydown', function(e) {{ e.stopPropagation(); }}, true);
         document.addEventListener('copy', function(e) {{ e.stopPropagation(); }}, true);
+        async function writeToClipboard(text) {{
+          try {{
+            await navigator.clipboard.writeText(text);
+            return true;
+          }} catch (err) {{
+            const helper = document.createElement('textarea');
+            helper.value = text;
+            helper.setAttribute('readonly', '');
+            helper.style.position = 'fixed';
+            helper.style.left = '-9999px';
+            helper.style.top = '-9999px';
+            document.body.appendChild(helper);
+            helper.select();
+            const ok = document.execCommand('copy');
+            document.body.removeChild(helper);
+            return ok;
+          }}
+        }}
+        async function copyText(text, button) {{
+          const original = button.innerText;
+          const ok = await writeToClipboard(text);
+          button.innerText = ok ? 'Copied' : 'Copy failed';
+          setTimeout(() => {{ button.innerText = original; }}, 1200);
+        }}
         async function copyAll() {{
           const textEl = document.getElementById('plainText');
           const status = document.getElementById('copyStatus');
           if (!textEl) return;
-          try {{
-            await navigator.clipboard.writeText(textEl.value);
+          const ok = await writeToClipboard(textEl.value);
+          if (ok) {{
             status.innerText = 'Copied';
-          }} catch (err) {{
+          }} else {{
             textEl.style.position = 'fixed';
             textEl.style.left = '8px';
             textEl.style.top = '8px';

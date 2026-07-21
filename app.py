@@ -119,16 +119,89 @@ def guess_match_from_link_text(text: str) -> str:
     return text
 
 
+def get_preview_href_count(tag) -> int:
+    """Count match-preview links inside a listing fragment."""
+    if not tag:
+        return 0
+    return sum(1 for link in tag.find_all("a", href=True) if is_preview_url(urljoin("https://www.freesupertips.com", link.get("href", ""))))
+
+
+def get_listing_context_text(a) -> str:
+    """Return the smallest useful listing-card text around a preview link.
+
+    On the listing pages, the kickoff time can sit in a neighbouring element
+    rather than inside the anchor text itself. This walks up the DOM and picks
+    the smallest parent that contains this preview link plus a visible time,
+    while avoiding broad league containers that contain several fixtures.
+    """
+    link_text = clean_space(a.get_text(" ", strip=True))
+    best = link_text
+
+    for parent in a.parents:
+        if getattr(parent, "name", None) in {"body", "html", "main"}:
+            break
+        text = clean_space(parent.get_text(" ", strip=True))
+        if not text:
+            continue
+        if not extract_time_from_text(text):
+            continue
+
+        preview_count = get_preview_href_count(parent)
+        # Prefer the smallest parent that looks like a single fixture/card.
+        if preview_count <= 1 and len(text) <= 500:
+            return text
+
+        # Keep a fallback in case the markup groups a pair of fixture cards
+        # together, but do not return it immediately because it may contain
+        # more than one time.
+        if len(best) <= len(link_text) and len(text) <= 500:
+            best = text
+
+    return best
+
+
+def extract_nearest_time_for_anchor(a) -> str:
+    """Extract the visible listing-page time for a preview card."""
+    direct_text = clean_space(a.get_text(" ", strip=True))
+    direct_time = extract_time_from_text(direct_text)
+    if direct_time:
+        return direct_time
+
+    context_text = get_listing_context_text(a)
+    context_time = extract_time_from_text(context_text)
+    if context_time:
+        return context_time
+
+    # Last-resort sibling scan for markup where the time is adjacent to, but
+    # not wrapped with, the preview link.
+    parent = a.parent
+    for _ in range(4):
+        if not parent:
+            break
+        pieces = []
+        for node in list(parent.children):
+            pieces.append(clean_space(node.get_text(" ", strip=True) if hasattr(node, "get_text") else str(node)))
+        text = clean_space(" ".join(pieces))
+        found = extract_time_from_text(text)
+        if found:
+            return found
+        parent = parent.parent
+
+    return ""
+
+
 def make_preview_link(listing_url: str, a) -> Optional[PreviewLink]:
     absolute = urljoin(listing_url, a.get("href", ""))
     if not is_preview_url(absolute):
         return None
     link_text = clean_space(a.get_text(" ", strip=True))
+    context_text = get_listing_context_text(a)
+    listing_time = extract_nearest_time_for_anchor(a)
     return PreviewLink(
         url=absolute,
         link_text=link_text,
-        listing_time=extract_time_from_text(link_text),
-        listing_match=guess_match_from_link_text(link_text),
+        listing_time=listing_time,
+        listing_match=guess_match_from_link_text(context_text or link_text),
     )
 
 
@@ -541,7 +614,10 @@ def extract_tips_from_preview(url: str, html_text: str, listing: Optional[Previe
     meta = extract_match_metadata(soup)
 
     if listing:
-        if not meta["time"] and listing.listing_time:
+        # The preview article can expose UTC/GMT-style structured times, while
+        # the listing card shows the site/user-facing local time. Prefer the
+        # listing-page time whenever it is available.
+        if listing.listing_time:
             meta["time"] = listing.listing_time
         if not meta["match"] and listing.listing_match:
             meta["match"] = listing.listing_match
@@ -959,7 +1035,7 @@ def main():
             """
 - This version expects preview pages to contain `.IndividualTipPrediction` blocks.
 - Article role is order-based, but Market type is normalised for filtering. Combined tips also carry multiple filter buckets. For example, "Portugal and Both Teams To Score" appears under "Team To Win & BTTS", "Team To Win" and "Both Teams To Score".
-- The tomorrow/upcoming-page scraper starts after the first main section "See All" marker, skips per-league footer links like "See All UEFA Champions League Predictions", and stops at the league filter/FAQ/footer area.
+- The tomorrow/upcoming-page scraper starts after the first main section "See All" marker, skips per-league footer links like "See All UEFA Champions League Predictions", and stops at the league filter/FAQ/footer area. It prefers the kickoff time visible on the listing card over any article-page timestamp.
 - `Odds when tipped` comes from the visible odds label, e.g. `15/4 odds when tipped`.
 - `Current decimal from returns` is calculated from the selected return table stake when available.
 """

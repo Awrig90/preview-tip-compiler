@@ -1,6 +1,8 @@
 import re
 import html
 import json
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin, urlparse
@@ -13,6 +15,8 @@ from bs4 import BeautifulSoup
 
 
 DEFAULT_TOMORROW_URL = "https://www.freesupertips.com/predictions/tomorrows-football-predictions/"
+UK_TZ = ZoneInfo("Europe/London")
+
 DEFAULT_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -105,6 +109,72 @@ def extract_time_from_text(text: str) -> str:
     return f"{base}+{plus}" if plus else base
 
 
+def _normalise_iso_candidate(value: str) -> str:
+    value = clean_space(value)
+    # datetime.fromisoformat accepts +00:00 but not Z or +0000 consistently.
+    value = value.replace("Z", "+00:00")
+    value = re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", value)
+    return value
+
+
+def parse_uk_time_from_datetime_text(text: str) -> str:
+    """Find a timezone-aware datetime in HTML/text and return Europe/London time.
+
+    FST often stores fixture kickoffs as UTC/GMT in the raw HTML, while the
+    frontend renders the local UK time. Converting timezone-aware datetimes is
+    safer than reading the raw HH:MM text directly during BST.
+    """
+    if not text:
+        return ""
+
+    # Match ISO/RFC3339-ish datetime values with an explicit timezone.
+    pattern = re.compile(
+        r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})\b"
+    )
+    for raw in pattern.findall(str(text)):
+        candidate = _normalise_iso_candidate(raw.replace(" ", "T"))
+        try:
+            dt = datetime.fromisoformat(candidate)
+        except ValueError:
+            continue
+        if dt.tzinfo is None:
+            continue
+        return dt.astimezone(UK_TZ).strftime("%H:%M")
+    return ""
+
+
+def extract_uk_time_from_tag(tag) -> str:
+    """Extract UK-local kickoff time from a listing/fixture card tag.
+
+    Prefer timezone-aware datetime attributes because raw HTML text can be UTC
+    while the visible frontend card displays BST-adjusted UK time.
+    """
+    if not tag:
+        return ""
+
+    attr_priority = ("datetime", "data-time", "data-date", "data-start", "data-kickoff", "content")
+
+    # First inspect datetime-ish attributes on the tag and descendants.
+    for node in [tag] + list(tag.find_all(True)):
+        attrs = getattr(node, "attrs", {}) or {}
+        for attr in attr_priority:
+            if attr in attrs:
+                value = attrs.get(attr)
+                if isinstance(value, (list, tuple)):
+                    value = " ".join(str(x) for x in value)
+                found = parse_uk_time_from_datetime_text(str(value))
+                if found:
+                    return found
+
+    # Then inspect the compact HTML for embedded ISO datetime strings.
+    found = parse_uk_time_from_datetime_text(str(tag))
+    if found:
+        return found
+
+    # Final fallback: visible raw text such as 18:00 or 00:00+1.
+    return extract_time_from_text(clean_space(tag.get_text(" ", strip=True)))
+
+
 def guess_match_from_link_text(text: str) -> str:
     text = clean_space(text)
     if not text:
@@ -126,16 +196,9 @@ def get_preview_href_count(tag) -> int:
     return sum(1 for link in tag.find_all("a", href=True) if is_preview_url(urljoin("https://www.freesupertips.com", link.get("href", ""))))
 
 
-def get_listing_context_text(a) -> str:
-    """Return the smallest useful listing-card text around a preview link.
-
-    On the listing pages, the kickoff time can sit in a neighbouring element
-    rather than inside the anchor text itself. This walks up the DOM and picks
-    the smallest parent that contains this preview link plus a visible time,
-    while avoiding broad league containers that contain several fixtures.
-    """
-    link_text = clean_space(a.get_text(" ", strip=True))
-    best = link_text
+def get_listing_context_tag(a):
+    """Return the smallest useful fixture-card tag around a preview link."""
+    best = None
 
     for parent in a.parents:
         if getattr(parent, "name", None) in {"body", "html", "main"}:
@@ -143,46 +206,50 @@ def get_listing_context_text(a) -> str:
         text = clean_space(parent.get_text(" ", strip=True))
         if not text:
             continue
-        if not extract_time_from_text(text):
+
+        has_time = bool(extract_time_from_text(text) or extract_uk_time_from_tag(parent))
+        if not has_time:
             continue
 
         preview_count = get_preview_href_count(parent)
         # Prefer the smallest parent that looks like a single fixture/card.
         if preview_count <= 1 and len(text) <= 500:
-            return text
+            return parent
 
-        # Keep a fallback in case the markup groups a pair of fixture cards
-        # together, but do not return it immediately because it may contain
-        # more than one time.
-        if len(best) <= len(link_text) and len(text) <= 500:
-            best = text
+        if best is None and len(text) <= 700:
+            best = parent
 
     return best
 
 
-def extract_nearest_time_for_anchor(a) -> str:
-    """Extract the visible listing-page time for a preview card."""
-    direct_text = clean_space(a.get_text(" ", strip=True))
-    direct_time = extract_time_from_text(direct_text)
-    if direct_time:
-        return direct_time
+def get_listing_context_text(a) -> str:
+    """Return the smallest useful listing-card text around a preview link."""
+    context_tag = get_listing_context_tag(a)
+    if context_tag is not None:
+        return clean_space(context_tag.get_text(" ", strip=True))
+    return clean_space(a.get_text(" ", strip=True))
 
-    context_text = get_listing_context_text(a)
-    context_time = extract_time_from_text(context_text)
-    if context_time:
-        return context_time
+
+def extract_nearest_time_for_anchor(a) -> str:
+    """Extract the UK-local listing-page time for a preview card."""
+    context_tag = get_listing_context_tag(a)
+    if context_tag is not None:
+        found = extract_uk_time_from_tag(context_tag)
+        if found:
+            return found
+
+    # Direct-anchor fallback.
+    found = extract_uk_time_from_tag(a)
+    if found:
+        return found
 
     # Last-resort sibling scan for markup where the time is adjacent to, but
     # not wrapped with, the preview link.
     parent = a.parent
-    for _ in range(4):
+    for _ in range(5):
         if not parent:
             break
-        pieces = []
-        for node in list(parent.children):
-            pieces.append(clean_space(node.get_text(" ", strip=True) if hasattr(node, "get_text") else str(node)))
-        text = clean_space(" ".join(pieces))
-        found = extract_time_from_text(text)
+        found = extract_uk_time_from_tag(parent)
         if found:
             return found
         parent = parent.parent
@@ -1035,7 +1102,7 @@ def main():
             """
 - This version expects preview pages to contain `.IndividualTipPrediction` blocks.
 - Article role is order-based, but Market type is normalised for filtering. Combined tips also carry multiple filter buckets. For example, "Portugal and Both Teams To Score" appears under "Team To Win & BTTS", "Team To Win" and "Both Teams To Score".
-- The tomorrow/upcoming-page scraper starts after the first main section "See All" marker, skips per-league footer links like "See All UEFA Champions League Predictions", and stops at the league filter/FAQ/footer area. It prefers the kickoff time visible on the listing card over any article-page timestamp.
+- The tomorrow/upcoming-page scraper starts after the first main section "See All" marker, skips per-league footer links like "See All UEFA Champions League Predictions", and stops at the league filter/FAQ/footer area. It prefers the kickoff time from the listing card and converts timezone-aware raw datetimes into Europe/London time, so BST/GMT changes should be handled automatically.
 - `Odds when tipped` comes from the visible odds label, e.g. `15/4 odds when tipped`.
 - `Current decimal from returns` is calculated from the selected return table stake when available.
 """

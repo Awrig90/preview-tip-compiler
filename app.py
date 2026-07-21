@@ -1,7 +1,7 @@
 import re
 import html
 import json
-from datetime import datetime
+from datetime import date, datetime, time as dt_time, timedelta, timezone
 from zoneinfo import ZoneInfo
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Tuple
@@ -231,25 +231,28 @@ def get_listing_context_text(a) -> str:
 
 
 def extract_nearest_time_for_anchor(a) -> str:
-    """Extract the UK-local listing-page time for a preview card."""
+    """Extract the raw kickoff clock shown in the server HTML.
+
+    FreeSuperTips currently sends fixture clocks in GMT/UTC in the HTML and
+    converts them to the browser's UK-local time on the frontend.  We keep the
+    raw clock here and perform the GMT/BST conversion only after the preview
+    page has supplied the fixture date.
+    """
     context_tag = get_listing_context_tag(a)
     if context_tag is not None:
-        found = extract_uk_time_from_tag(context_tag)
+        found = extract_time_from_text(clean_space(context_tag.get_text(" ", strip=True)))
         if found:
             return found
 
-    # Direct-anchor fallback.
-    found = extract_uk_time_from_tag(a)
+    found = extract_time_from_text(clean_space(a.get_text(" ", strip=True)))
     if found:
         return found
 
-    # Last-resort sibling scan for markup where the time is adjacent to, but
-    # not wrapped with, the preview link.
     parent = a.parent
     for _ in range(5):
         if not parent:
             break
-        found = extract_uk_time_from_tag(parent)
+        found = extract_time_from_text(clean_space(parent.get_text(" ", strip=True)))
         if found:
             return found
         parent = parent.parent
@@ -453,6 +456,92 @@ def extract_reasoning(block) -> str:
             continue
         lines.append(line)
     return clean_space(" ".join(lines))
+
+
+MONTHS = {
+    "january": 1, "jan": 1,
+    "february": 2, "feb": 2,
+    "march": 3, "mar": 3,
+    "april": 4, "apr": 4,
+    "may": 5,
+    "june": 6, "jun": 6,
+    "july": 7, "jul": 7,
+    "august": 8, "aug": 8,
+    "september": 9, "sep": 9, "sept": 9,
+    "october": 10, "oct": 10,
+    "november": 11, "nov": 11,
+    "december": 12, "dec": 12,
+}
+
+
+def resolve_fixture_date(date_label: str) -> Optional[date]:
+    """Resolve article labels such as Today, Tomorrow or Thursday 23rd July."""
+    label = clean_space(date_label).lower()
+    today_uk = datetime.now(UK_TZ).date()
+
+    if not label:
+        return None
+    if label == "today":
+        return today_uk
+    if label == "tomorrow":
+        return today_uk + timedelta(days=1)
+
+    # Examples: Thursday 23rd July, 23 July, Tue 21 Jul 2026.
+    match = re.search(
+        r"\b(\d{1,2})(?:st|nd|rd|th)?\s+"
+        r"(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+        r"jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
+        r"(?:\s+(\d{4}))?\b",
+        label,
+        flags=re.I,
+    )
+    if not match:
+        return None
+
+    day = int(match.group(1))
+    month = MONTHS.get(match.group(2).lower())
+    if not month:
+        return None
+    year = int(match.group(3)) if match.group(3) else today_uk.year
+
+    try:
+        candidate = date(year, month, day)
+    except ValueError:
+        return None
+
+    # A yearless page around New Year may refer to the following calendar year.
+    if not match.group(3) and candidate < today_uk - timedelta(days=180):
+        try:
+            candidate = date(year + 1, month, day)
+        except ValueError:
+            return None
+    return candidate
+
+
+def convert_gmt_clock_to_london(raw_clock: str, fixture_date: Optional[date]) -> str:
+    """Convert a server-rendered GMT/UTC clock to Europe/London.
+
+    The visible site adjusts these raw clocks for BST in the browser.  Parsing
+    the fixture date lets Python make the same adjustment without Playwright.
+    """
+    raw_clock = clean_space(raw_clock)
+    if not raw_clock or fixture_date is None:
+        return raw_clock
+
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})(?:\+(\d+))?", raw_clock)
+    if not match:
+        return raw_clock
+
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    extra_days = int(match.group(3) or 0)
+    if hour > 23 or minute > 59:
+        return raw_clock
+
+    utc_date = fixture_date + timedelta(days=extra_days)
+    utc_dt = datetime.combine(utc_date, dt_time(hour, minute), tzinfo=timezone.utc)
+    local_dt = utc_dt.astimezone(UK_TZ)
+    return local_dt.strftime("%H:%M")
 
 
 def extract_match_metadata(soup: BeautifulSoup) -> Dict[str, str]:
@@ -680,14 +769,15 @@ def extract_tips_from_preview(url: str, html_text: str, listing: Optional[Previe
     soup = BeautifulSoup(html_text, "html.parser")
     meta = extract_match_metadata(soup)
 
-    if listing:
-        # The preview article can expose UTC/GMT-style structured times, while
-        # the listing card shows the site/user-facing local time. Prefer the
-        # listing-page time whenever it is available.
-        if listing.listing_time:
-            meta["time"] = listing.listing_time
-        if not meta["match"] and listing.listing_match:
-            meta["match"] = listing.listing_match
+    # Both the listing and article HTML expose the kickoff clock in GMT/UTC.
+    # The browser-facing site converts it to Europe/London, so reproduce that
+    # conversion from the article's fixture date (including BST automatically).
+    raw_kickoff = listing.listing_time if listing and listing.listing_time else meta.get("time", "")
+    fixture_date = resolve_fixture_date(meta.get("date", ""))
+    meta["time"] = convert_gmt_clock_to_london(raw_kickoff, fixture_date)
+
+    if listing and not meta["match"] and listing.listing_match:
+        meta["match"] = listing.listing_match
 
     blocks = soup.select(".IndividualTipPrediction")
     rows: List[TipRow] = []
@@ -1102,7 +1192,7 @@ def main():
             """
 - This version expects preview pages to contain `.IndividualTipPrediction` blocks.
 - Article role is order-based, but Market type is normalised for filtering. Combined tips also carry multiple filter buckets. For example, "Portugal and Both Teams To Score" appears under "Team To Win & BTTS", "Team To Win" and "Both Teams To Score".
-- The tomorrow/upcoming-page scraper starts after the first main section "See All" marker, skips per-league footer links like "See All UEFA Champions League Predictions", and stops at the league filter/FAQ/footer area. It prefers the kickoff time from the listing card and converts timezone-aware raw datetimes into Europe/London time, so BST/GMT changes should be handled automatically.
+- The tomorrow/upcoming-page scraper starts after the first main section "See All" marker, skips per-league footer links like "See All UEFA Champions League Predictions", and stops at the league filter/FAQ/footer area. It reads the raw GMT/UTC kickoff clock from the listing/article HTML and converts it to Europe/London using the fixture date, so BST/GMT changes are handled automatically.
 - `Odds when tipped` comes from the visible odds label, e.g. `15/4 odds when tipped`.
 - `Current decimal from returns` is calculated from the selected return table stake when available.
 """

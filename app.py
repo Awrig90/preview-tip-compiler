@@ -141,17 +141,36 @@ def is_plain_see_all_link(a) -> bool:
     return "/predictions/" in href and "predictions-betting-tips-match-previews" not in href
 
 
+def is_league_footer_link(tag) -> bool:
+    """Return True for footer links like 'See All UEFA Champions League Predictions'.
+
+    Those appear inside each league block. They are useful visual separators on the
+    frontend, but they should not stop extraction because the tomorrow page can
+    contain several league blocks one after another.
+    """
+    text = clean_space(tag.get_text(" ", strip=True)).lower()
+    return bool(
+        tag.name == "a"
+        and text.startswith("see all")
+        and "prediction" in text
+        and not is_plain_see_all_link(tag)
+    )
+
+
 def is_end_of_main_preview_section(tag) -> bool:
     text = clean_space(tag.get_text(" ", strip=True)).lower()
     if not text:
         return False
-    # The main league block usually ends with "See All {League} Predictions".
-    if tag.name == "a" and text.startswith("see all") and "prediction" in text and not is_plain_see_all_link(tag):
-        return True
-    # Fallback guardrails for when the footer link is missing or markup changes.
+    # These guardrails mark the end of the whole fixture listing area, not the end
+    # of a single league card. Per-league footer links are skipped, not used as an
+    # end marker, so pages with several competitions still return every shown match.
     if "select league" in text:
         return True
     if "tomorrow’s football predictions faqs" in text or "tomorrow's football predictions faqs" in text:
+        return True
+    if "football betting tips faqs" in text:
+        return True
+    if "free bets and offers" in text:
         return True
     return False
 
@@ -176,6 +195,11 @@ def extract_preview_links(listing_url: str, html_text: str) -> List[PreviewLink]
     for tag in search_tags:
         if is_end_of_main_preview_section(tag):
             break
+        # Do not break on links like "See All UEFA Champions League Predictions".
+        # They appear between league blocks, so breaking here would only collect the
+        # first competition on the page.
+        if is_league_footer_link(tag):
+            continue
         if tag.name != "a" or not tag.get("href"):
             continue
         preview_link = make_preview_link(listing_url, tag)
@@ -935,6 +959,7 @@ def main():
             """
 - This version expects preview pages to contain `.IndividualTipPrediction` blocks.
 - Article role is order-based, but Market type is normalised for filtering. Combined tips also carry multiple filter buckets. For example, "Portugal and Both Teams To Score" appears under "Team To Win & BTTS", "Team To Win" and "Both Teams To Score".
+- The tomorrow/upcoming-page scraper starts after the first main section "See All" marker, skips per-league footer links like "See All UEFA Champions League Predictions", and stops at the league filter/FAQ/footer area.
 - `Odds when tipped` comes from the visible odds label, e.g. `15/4 odds when tipped`.
 - `Current decimal from returns` is calculated from the selected return table stake when available.
 """

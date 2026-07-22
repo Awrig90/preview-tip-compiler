@@ -769,10 +769,14 @@ def extract_tips_from_preview(url: str, html_text: str, listing: Optional[Previe
     soup = BeautifulSoup(html_text, "html.parser")
     meta = extract_match_metadata(soup)
 
-    # Both the listing and article HTML expose the kickoff clock in GMT/UTC.
-    # The browser-facing site converts it to Europe/London, so reproduce that
-    # conversion from the article's fixture date (including BST automatically).
-    raw_kickoff = listing.listing_time if listing and listing.listing_time else meta.get("time", "")
+    # Use the kickoff clock from each individual preview page, not from the
+    # listing card. The listing scraper can accidentally pick up the first card
+    # in a competition block and reuse it across the whole league section. The
+    # article's GameBullets block is the reliable per-fixture source:
+    #   <ul class="GameBullets"><li>16:00</li><li>Tomorrow</li>...</ul>
+    # The raw clock is GMT/UTC, so convert it to Europe/London using the
+    # article's own fixture date label. This handles BST/GMT automatically.
+    raw_kickoff = meta.get("time", "")
     fixture_date = resolve_fixture_date(meta.get("date", ""))
     meta["time"] = convert_gmt_clock_to_london(raw_kickoff, fixture_date)
 
@@ -1192,7 +1196,7 @@ def main():
             """
 - This version expects preview pages to contain `.IndividualTipPrediction` blocks.
 - Article role is order-based, but Market type is normalised for filtering. Combined tips also carry multiple filter buckets. For example, "Portugal and Both Teams To Score" appears under "Team To Win & BTTS", "Team To Win" and "Both Teams To Score".
-- The tomorrow/upcoming-page scraper starts after the first main section "See All" marker, skips per-league footer links like "See All UEFA Champions League Predictions", and stops at the league filter/FAQ/footer area. It reads the raw GMT/UTC kickoff clock from the listing/article HTML and converts it to Europe/London using the fixture date, so BST/GMT changes are handled automatically.
+- The tomorrow/upcoming-page scraper starts after the first main section "See All" marker, skips per-league footer links like "See All UEFA Champions League Predictions", and stops at the league filter/FAQ/footer area. Kickoff time is taken from each individual preview page's `GameBullets` block, then converted from GMT/UTC to Europe/London using the fixture date, so BST/GMT changes are handled automatically.
 - `Odds when tipped` comes from the visible odds label, e.g. `15/4 odds when tipped`.
 - `Current decimal from returns` is calculated from the selected return table stake when available.
 """

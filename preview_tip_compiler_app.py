@@ -17,7 +17,7 @@ from bs4 import BeautifulSoup
 DEFAULT_TOMORROW_URL = "https://www.freesupertips.com/predictions/tomorrows-football-predictions/"
 UK_TZ = ZoneInfo("Europe/London")
 UTC_TZ = ZoneInfo("UTC")
-PARSER_VERSION = "2026-07-21-listing-time-v4"
+PARSER_VERSION = "2026-10-08-preview-clock-author-v5"
 
 DEFAULT_HEADERS = {
     "User-Agent": (
@@ -64,6 +64,7 @@ class TipRow:
     reasoning: str
     url: str
     status: str = "OK"
+    author: str = ""
 
 
 def clean_space(value: str) -> str:
@@ -543,7 +544,46 @@ def extract_reasoning(block) -> str:
     return clean_space(" ".join(lines))
 
 
-def extract_match_metadata(soup: BeautifulSoup) -> Dict[str, str]:
+def extract_preview_clock(soup: BeautifulSoup, url: str = "") -> Tuple[str, str]:
+    """Read the preview's UK display clock without converting a timestamp.
+
+    FST hydrates GameBullets in the browser: its server-rendered clock can be
+    UTC. The same preview's startString contains the literal UK display time
+    (verified against rendered BST and GMT pages). Copy its HH:MM, never derive
+    it from start, publication dates, listing cards or the server timezone.
+    A dynamic page with missing/malformed data must not use its raw UTC clock.
+    """
+    script = soup.select_one("script#__NEXT_DATA__")
+    if script is not None:
+        try:
+            data = json.loads(script.string or script.get_text())
+            previews = data["props"]["pageProps"]["responses"]["predictionsSingle"]
+            if not isinstance(previews, list) or len(previews) != 1:
+                raise ValueError("expected one preview record")
+            preview = previews[0]
+            if url and urlparse(preview.get("url", "")).path.rstrip("/") != urlparse(url).path.rstrip("/"):
+                raise ValueError("preview record does not match the requested URL")
+            value = preview.get("startString")
+            if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2} ([01]\d|2[0-3]):[0-5]\d:[0-5]\d", value):
+                raise ValueError("missing or malformed preview startString")
+            # Validate the date, but do not interpret or convert its timezone.
+            datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+            return value[11:16], ""
+        except (ValueError, TypeError, KeyError, AttributeError) as exc:
+            return "", f"Preview time unavailable: {exc}"
+
+    if soup.select_one("#__next") is not None:
+        return "", "Preview time unavailable: missing preview hydration data"
+
+    # Static HTML with no hydration payload: preserve the actual clock.
+    clock = soup.select_one(".GameBullets > li")
+    value = clean_space(clock.get_text(" ", strip=True)) if clock else ""
+    if re.fullmatch(r"(?:[01]?\d|2[0-3]):[0-5]\d(?:\s*\+\s*\d+)?", value):
+        return value.replace(" ", ""), ""
+    return "", "Preview time unavailable: missing or malformed GameBullets clock"
+
+
+def extract_match_metadata(soup: BeautifulSoup, url: str = "") -> Dict[str, str]:
     h1 = soup.find("h1")
     raw_title = clean_space(h1.get_text(" ", strip=True)) if h1 else ""
     match_name = re.sub(r"\s+Predictions\s*$", "", raw_title, flags=re.I).strip()
@@ -561,20 +601,14 @@ def extract_match_metadata(soup: BeautifulSoup) -> Dict[str, str]:
             published = line
             break
 
-    # Look near the title for time/date/stadium. This is intentionally loose because the page markup may change.
-    start_idx = 0
-    if raw_title in lines:
-        start_idx = lines.index(raw_title)
-    window = lines[start_idx : start_idx + 25]
-    for idx, line in enumerate(window):
-        if not kickoff_time and re.fullmatch(r"\d{1,2}:\d{2}(?:\s*\+\s*\d+|\+\d+)?", line):
-            kickoff_time = line.replace(" ", "")
-            # Usually the next line is Today/Tomorrow/date and the one after that is the stadium.
-            if idx + 1 < len(window):
-                date_label = window[idx + 1]
-            if idx + 2 < len(window):
-                stadium = window[idx + 2]
-            break
+    kickoff_time, time_error = extract_preview_clock(soup, url)
+    bullets = soup.select(".GameBullets > li")
+    if len(bullets) > 1:
+        date_label = clean_space(bullets[1].get_text(" ", strip=True))
+    if len(bullets) > 2:
+        stadium = clean_space(bullets[2].get_text(" ", strip=True))
+    author_node = soup.select_one(".AuthSocial .Author__name")
+    author = clean_space(author_node.get_text(" ", strip=True)) if author_node else ""
 
     return {
         "match": match_name,
@@ -582,6 +616,8 @@ def extract_match_metadata(soup: BeautifulSoup) -> Dict[str, str]:
         "time": kickoff_time,
         "date": date_label,
         "stadium": stadium,
+        "author": author,
+        "time_error": time_error,
     }
 
 
@@ -766,16 +802,10 @@ def make_cms_line(row: pd.Series, odds_source: str) -> str:
 
 def extract_tips_from_preview(url: str, html_text: str, listing: Optional[PreviewLink] = None) -> List[TipRow]:
     soup = BeautifulSoup(html_text, "html.parser")
-    meta = extract_match_metadata(soup)
+    meta = extract_match_metadata(soup, url)
 
-    if listing:
-        # The preview article can expose UTC/GMT-style structured times, while
-        # the listing card shows the site/user-facing local time. Prefer the
-        # listing-page time whenever it is available.
-        if listing.listing_time:
-            meta["time"] = listing.listing_time
-        if not meta["match"] and listing.listing_match:
-            meta["match"] = listing.listing_match
+    if listing and not meta["match"] and listing.listing_match:
+        meta["match"] = listing.listing_match
 
     blocks = soup.select(".IndividualTipPrediction")
     rows: List[TipRow] = []
@@ -808,7 +838,8 @@ def extract_tips_from_preview(url: str, html_text: str, listing: Optional[Previe
                 current_decimal_from_returns=current_decimal,
                 reasoning=reasoning,
                 url=url,
-                status="OK" if reasoning else "Missing reasoning",
+                status="; ".join(x for x in (meta["time_error"], "" if reasoning else "Missing reasoning") if x) or "OK",
+                author=meta["author"],
             )
         )
 
@@ -827,7 +858,8 @@ def extract_tips_from_preview(url: str, html_text: str, listing: Optional[Previe
                 current_decimal_from_returns=None,
                 reasoning="",
                 url=url,
-                status="No tip blocks found",
+                status="; ".join(x for x in ("No tip blocks found", meta["time_error"]) if x),
+                author=meta["author"],
             )
         )
 
@@ -852,6 +884,7 @@ def rows_to_dataframe(rows: List[TipRow]) -> pd.DataFrame:
                 "reasoning",
                 "url",
                 "status",
+                "author",
             ]
         )
     return df
@@ -1010,7 +1043,13 @@ def build_filtered_df(df: pd.DataFrame) -> pd.DataFrame:
     search = st.sidebar.text_input("Search fixture/selection/reasoning", "")
     status_options = sorted([x for x in filtered["status"].dropna().unique().tolist() if x])
     statuses = st.sidebar.multiselect("Status", status_options, default=status_options)
+    spotlight_only = st.sidebar.checkbox("SpotlightIQ only", value=False)
 
+    if spotlight_only:
+        authors = filtered.get("author", pd.Series("", index=filtered.index))
+        filtered = filtered[authors.fillna("").astype(str).str.strip().str.casefold().eq("spotlightiq")]
+        if filtered.empty:
+            return filtered
     if markets:
         market_set = set(markets)
         filtered = filtered[
@@ -1099,7 +1138,7 @@ def main():
             rows.append(
                 TipRow(
                     date="",
-                    time=link.listing_time,
+                    time="",
                     match=link.listing_match,
                     market="",
                     market_type="",
@@ -1126,6 +1165,10 @@ def main():
             for err in errors:
                 st.warning(err)
 
+    time_failures = df["status"].str.contains("Preview time unavailable", na=False)
+    if time_failures.any():
+        st.warning("Some preview times could not be extracted. Their times are blank; see Status for the reason.")
+
     filtered = build_filtered_df(df)
 
     st.subheader("Readable shortlist")
@@ -1144,6 +1187,7 @@ def main():
         "reasoning",
         "url",
         "status",
+        "author",
         "market",
         "date",
         "odds_decimal_from_tip",
@@ -1167,6 +1211,7 @@ def main():
             "reasoning": st.column_config.TextColumn("Reasoning", width="large"),
             "url": st.column_config.LinkColumn("URL", width="medium"),
             "status": st.column_config.TextColumn("Status", width="small"),
+            "author": st.column_config.TextColumn("Author", width="small"),
             "market": st.column_config.TextColumn("Article role", width="small"),
         },
     )
@@ -1194,7 +1239,7 @@ def main():
             """
 - This version expects preview pages to contain `.IndividualTipPrediction` blocks.
 - Article role is order-based, but Market type is normalised for filtering. Combined tips also carry multiple filter buckets. For example, "Portugal and Both Teams To Score" appears under "Team To Win & BTTS", "Team To Win" and "Both Teams To Score".
-- The tomorrow/upcoming-page scraper starts after the first main section "See All" marker, skips per-league footer links like "See All UEFA Champions League Predictions", and stops at the league filter/FAQ/footer area. It reads the raw listing-card time as UTC and converts it using the fixture date into Europe/London time, so the output matches the browser during both BST and GMT.
+- Kickoff time is the literal UK display clock supplied by the individual preview (`predictionsSingle[0].startString` on FST dynamic pages, or `GameBullets` text on static pages). It is not converted from UTC or replaced by listing times. Extraction failures leave the time blank and appear in Status.
 - `Odds when tipped` comes from the visible odds label, e.g. `15/4 odds when tipped`.
 - `Current decimal from returns` is calculated from the selected return table stake when available.
 """

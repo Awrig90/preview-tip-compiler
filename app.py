@@ -1,7 +1,7 @@
 import re
 import html
 import json
-from datetime import date, datetime, time as dt_time, timedelta, timezone
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Tuple
@@ -61,6 +61,7 @@ class TipRow:
     reasoning: str
     url: str
     status: str = "OK"
+    author: str = ""
 
 
 def clean_space(value: str) -> str:
@@ -458,93 +459,46 @@ def extract_reasoning(block) -> str:
     return clean_space(" ".join(lines))
 
 
-MONTHS = {
-    "january": 1, "jan": 1,
-    "february": 2, "feb": 2,
-    "march": 3, "mar": 3,
-    "april": 4, "apr": 4,
-    "may": 5,
-    "june": 6, "jun": 6,
-    "july": 7, "jul": 7,
-    "august": 8, "aug": 8,
-    "september": 9, "sep": 9, "sept": 9,
-    "october": 10, "oct": 10,
-    "november": 11, "nov": 11,
-    "december": 12, "dec": 12,
-}
+def extract_preview_clock(soup: BeautifulSoup, url: str = "") -> Tuple[str, str]:
+    """Read the preview's UK display clock without converting a timestamp.
 
-
-def resolve_fixture_date(date_label: str) -> Optional[date]:
-    """Resolve article labels such as Today, Tomorrow or Thursday 23rd July."""
-    label = clean_space(date_label).lower()
-    today_uk = datetime.now(UK_TZ).date()
-
-    if not label:
-        return None
-    if label == "today":
-        return today_uk
-    if label == "tomorrow":
-        return today_uk + timedelta(days=1)
-
-    # Examples: Thursday 23rd July, 23 July, Tue 21 Jul 2026.
-    match = re.search(
-        r"\b(\d{1,2})(?:st|nd|rd|th)?\s+"
-        r"(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
-        r"jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
-        r"(?:\s+(\d{4}))?\b",
-        label,
-        flags=re.I,
-    )
-    if not match:
-        return None
-
-    day = int(match.group(1))
-    month = MONTHS.get(match.group(2).lower())
-    if not month:
-        return None
-    year = int(match.group(3)) if match.group(3) else today_uk.year
-
-    try:
-        candidate = date(year, month, day)
-    except ValueError:
-        return None
-
-    # A yearless page around New Year may refer to the following calendar year.
-    if not match.group(3) and candidate < today_uk - timedelta(days=180):
-        try:
-            candidate = date(year + 1, month, day)
-        except ValueError:
-            return None
-    return candidate
-
-
-def convert_gmt_clock_to_london(raw_clock: str, fixture_date: Optional[date]) -> str:
-    """Convert a server-rendered GMT/UTC clock to Europe/London.
-
-    The visible site adjusts these raw clocks for BST in the browser.  Parsing
-    the fixture date lets Python make the same adjustment without Playwright.
+    FST hydrates GameBullets in the browser: its server-rendered clock can be
+    UTC. The same preview's startString contains the literal UK display time
+    (verified against rendered BST and GMT pages). Copy its HH:MM, never derive
+    it from start, publication dates, listing cards or the server timezone.
+    A dynamic page with missing/malformed data must not use its raw UTC clock.
     """
-    raw_clock = clean_space(raw_clock)
-    if not raw_clock or fixture_date is None:
-        return raw_clock
+    script = soup.select_one("script#__NEXT_DATA__")
+    if script is not None:
+        try:
+            data = json.loads(script.string or script.get_text())
+            previews = data["props"]["pageProps"]["responses"]["predictionsSingle"]
+            if not isinstance(previews, list) or len(previews) != 1:
+                raise ValueError("expected one preview record")
+            preview = previews[0]
+            if url and urlparse(preview.get("url", "")).path.rstrip("/") != urlparse(url).path.rstrip("/"):
+                raise ValueError("preview record does not match the requested URL")
+            value = preview.get("startString")
+            if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2} ([01]\d|2[0-3]):[0-5]\d:[0-5]\d", value):
+                raise ValueError("missing or malformed preview startString")
+            # Validate the date, but do not interpret or convert its timezone.
+            datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+            return value[11:16], ""
+        except (ValueError, TypeError, KeyError, AttributeError) as exc:
+            return "", f"Preview time unavailable: {exc}"
 
-    match = re.fullmatch(r"(\d{1,2}):(\d{2})(?:\+(\d+))?", raw_clock)
-    if not match:
-        return raw_clock
+    if soup.select_one("#__next") is not None:
+        return "", "Preview time unavailable: missing preview hydration data"
 
-    hour = int(match.group(1))
-    minute = int(match.group(2))
-    extra_days = int(match.group(3) or 0)
-    if hour > 23 or minute > 59:
-        return raw_clock
-
-    utc_date = fixture_date + timedelta(days=extra_days)
-    utc_dt = datetime.combine(utc_date, dt_time(hour, minute), tzinfo=timezone.utc)
-    local_dt = utc_dt.astimezone(UK_TZ)
-    return local_dt.strftime("%H:%M")
+    # Static HTML with no hydration payload: preserve the actual clock.
+    clock = soup.select_one(".GameBullets > li")
+    value = clean_space(clock.get_text(" ", strip=True)) if clock else ""
+    if re.fullmatch(r"(?:[01]?\d|2[0-3]):[0-5]\d(?:\s*\+\s*\d+)?", value):
+        return value.replace(" ", ""), ""
+    return "", "Preview time unavailable: missing or malformed GameBullets clock"
 
 
-def extract_match_metadata(soup: BeautifulSoup) -> Dict[str, str]:
+def extract_match_metadata(soup: BeautifulSoup, url: str = "") -> Dict[str, str]:
     h1 = soup.find("h1")
     raw_title = clean_space(h1.get_text(" ", strip=True)) if h1 else ""
     match_name = re.sub(r"\s+Predictions\s*$", "", raw_title, flags=re.I).strip()
@@ -562,20 +516,14 @@ def extract_match_metadata(soup: BeautifulSoup) -> Dict[str, str]:
             published = line
             break
 
-    # Look near the title for time/date/stadium. This is intentionally loose because the page markup may change.
-    start_idx = 0
-    if raw_title in lines:
-        start_idx = lines.index(raw_title)
-    window = lines[start_idx : start_idx + 25]
-    for idx, line in enumerate(window):
-        if not kickoff_time and re.fullmatch(r"\d{1,2}:\d{2}(?:\s*\+\s*\d+|\+\d+)?", line):
-            kickoff_time = line.replace(" ", "")
-            # Usually the next line is Today/Tomorrow/date and the one after that is the stadium.
-            if idx + 1 < len(window):
-                date_label = window[idx + 1]
-            if idx + 2 < len(window):
-                stadium = window[idx + 2]
-            break
+    kickoff_time, time_error = extract_preview_clock(soup, url)
+    bullets = soup.select(".GameBullets > li")
+    if len(bullets) > 1:
+        date_label = clean_space(bullets[1].get_text(" ", strip=True))
+    if len(bullets) > 2:
+        stadium = clean_space(bullets[2].get_text(" ", strip=True))
+    author_node = soup.select_one(".AuthSocial .Author__name")
+    author = clean_space(author_node.get_text(" ", strip=True)) if author_node else ""
 
     return {
         "match": match_name,
@@ -583,6 +531,8 @@ def extract_match_metadata(soup: BeautifulSoup) -> Dict[str, str]:
         "time": kickoff_time,
         "date": date_label,
         "stadium": stadium,
+        "author": author,
+        "time_error": time_error,
     }
 
 
@@ -767,18 +717,7 @@ def make_cms_line(row: pd.Series, odds_source: str) -> str:
 
 def extract_tips_from_preview(url: str, html_text: str, listing: Optional[PreviewLink] = None) -> List[TipRow]:
     soup = BeautifulSoup(html_text, "html.parser")
-    meta = extract_match_metadata(soup)
-
-    # Use the kickoff clock from each individual preview page, not from the
-    # listing card. The listing scraper can accidentally pick up the first card
-    # in a competition block and reuse it across the whole league section. The
-    # article's GameBullets block is the reliable per-fixture source:
-    #   <ul class="GameBullets"><li>16:00</li><li>Tomorrow</li>...</ul>
-    # The raw clock is GMT/UTC, so convert it to Europe/London using the
-    # article's own fixture date label. This handles BST/GMT automatically.
-    raw_kickoff = meta.get("time", "")
-    fixture_date = resolve_fixture_date(meta.get("date", ""))
-    meta["time"] = convert_gmt_clock_to_london(raw_kickoff, fixture_date)
+    meta = extract_match_metadata(soup, url)
 
     if listing and not meta["match"] and listing.listing_match:
         meta["match"] = listing.listing_match
@@ -814,7 +753,8 @@ def extract_tips_from_preview(url: str, html_text: str, listing: Optional[Previe
                 current_decimal_from_returns=current_decimal,
                 reasoning=reasoning,
                 url=url,
-                status="OK" if reasoning else "Missing reasoning",
+                status="; ".join(x for x in (meta["time_error"], "" if reasoning else "Missing reasoning") if x) or "OK",
+                author=meta["author"],
             )
         )
 
@@ -833,7 +773,8 @@ def extract_tips_from_preview(url: str, html_text: str, listing: Optional[Previe
                 current_decimal_from_returns=None,
                 reasoning="",
                 url=url,
-                status="No tip blocks found",
+                status="; ".join(x for x in ("No tip blocks found", meta["time_error"]) if x),
+                author=meta["author"],
             )
         )
 
@@ -858,6 +799,7 @@ def rows_to_dataframe(rows: List[TipRow]) -> pd.DataFrame:
                 "reasoning",
                 "url",
                 "status",
+                "author",
             ]
         )
     return df
@@ -1016,7 +958,13 @@ def build_filtered_df(df: pd.DataFrame) -> pd.DataFrame:
     search = st.sidebar.text_input("Search fixture/selection/reasoning", "")
     status_options = sorted([x for x in filtered["status"].dropna().unique().tolist() if x])
     statuses = st.sidebar.multiselect("Status", status_options, default=status_options)
+    spotlight_only = st.sidebar.checkbox("SpotlightIQ only", value=False)
 
+    if spotlight_only:
+        authors = filtered.get("author", pd.Series("", index=filtered.index))
+        filtered = filtered[authors.fillna("").astype(str).str.strip().str.casefold().eq("spotlightiq")]
+        if filtered.empty:
+            return filtered
     if markets:
         market_set = set(markets)
         filtered = filtered[
@@ -1101,7 +1049,7 @@ def main():
             rows.append(
                 TipRow(
                     date="",
-                    time=link.listing_time,
+                    time="",
                     match=link.listing_match,
                     market="",
                     market_type="",
@@ -1128,6 +1076,10 @@ def main():
             for err in errors:
                 st.warning(err)
 
+    time_failures = df["status"].str.contains("Preview time unavailable", na=False)
+    if time_failures.any():
+        st.warning("Some preview times could not be extracted. Their times are blank; see Status for the reason.")
+
     filtered = build_filtered_df(df)
 
     st.subheader("Readable shortlist")
@@ -1146,6 +1098,7 @@ def main():
         "reasoning",
         "url",
         "status",
+        "author",
         "market",
         "date",
         "odds_decimal_from_tip",
@@ -1169,6 +1122,7 @@ def main():
             "reasoning": st.column_config.TextColumn("Reasoning", width="large"),
             "url": st.column_config.LinkColumn("URL", width="medium"),
             "status": st.column_config.TextColumn("Status", width="small"),
+            "author": st.column_config.TextColumn("Author", width="small"),
             "market": st.column_config.TextColumn("Article role", width="small"),
         },
     )
@@ -1196,7 +1150,7 @@ def main():
             """
 - This version expects preview pages to contain `.IndividualTipPrediction` blocks.
 - Article role is order-based, but Market type is normalised for filtering. Combined tips also carry multiple filter buckets. For example, "Portugal and Both Teams To Score" appears under "Team To Win & BTTS", "Team To Win" and "Both Teams To Score".
-- The tomorrow/upcoming-page scraper starts after the first main section "See All" marker, skips per-league footer links like "See All UEFA Champions League Predictions", and stops at the league filter/FAQ/footer area. Kickoff time is taken from each individual preview page's `GameBullets` block, then converted from GMT/UTC to Europe/London using the fixture date, so BST/GMT changes are handled automatically.
+- Kickoff time is the literal UK display clock supplied by the individual preview (`predictionsSingle[0].startString` on FST dynamic pages, or `GameBullets` text on static pages). It is not converted from UTC or replaced by listing times. Extraction failures leave the time blank and appear in Status.
 - `Odds when tipped` comes from the visible odds label, e.g. `15/4 odds when tipped`.
 - `Current decimal from returns` is calculated from the selected return table stake when available.
 """

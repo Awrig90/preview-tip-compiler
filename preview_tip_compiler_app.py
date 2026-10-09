@@ -1043,11 +1043,11 @@ def build_filtered_df(df: pd.DataFrame) -> pd.DataFrame:
     search = st.sidebar.text_input("Search fixture/selection/reasoning", "")
     status_options = sorted([x for x in filtered["status"].dropna().unique().tolist() if x])
     statuses = st.sidebar.multiselect("Status", status_options, default=status_options)
-    spotlight_only = st.sidebar.checkbox("SpotlightIQ only", value=False)
+    exclude_spotlight = st.sidebar.checkbox("Exclude SpotlightIQ", value=False)
 
-    if spotlight_only:
+    if exclude_spotlight:
         authors = filtered.get("author", pd.Series("", index=filtered.index))
-        filtered = filtered[authors.fillna("").astype(str).str.strip().str.casefold().eq("spotlightiq")]
+        filtered = filtered[~authors.fillna("").astype(str).str.strip().str.casefold().eq("spotlightiq")]
         if filtered.empty:
             return filtered
     if markets:
@@ -1079,6 +1079,7 @@ def main():
     if st.session_state.get("_parser_version") != PARSER_VERSION:
         st.session_state.pop("links", None)
         st.session_state.pop("compiled_df", None)
+        st.session_state.pop("compiled_snapshot", None)
         st.session_state["_parser_version"] = PARSER_VERSION
     st.title("Preview Tip Compiler")
     st.caption("Pull preview tips into readable, market-filterable shortlists with CMS-ready copy blocks.")
@@ -1089,74 +1090,89 @@ def main():
         max_previews = st.number_input("Max previews to fetch", min_value=1, max_value=100, value=30, step=1)
         odds_source = st.radio("Export odds", ["Odds when tipped", "Current decimal from returns"], index=0)
 
-    links: List[PreviewLink] = []
-    errors: List[str] = []
-
+    snapshot = st.session_state.get("compiled_snapshot")
     if mode == "Tomorrow page URL":
-        listing_url = st.text_input("Tomorrow predictions URL", value=DEFAULT_TOMORROW_URL)
-        run = st.button("Fetch previews", type="primary")
-        if run:
-            try:
-                listing_html = fetch_html(normalise_url(listing_url))
-                links = extract_preview_links(normalise_url(listing_url), listing_html)[: int(max_previews)]
-                st.session_state["links"] = [asdict(x) for x in links]
-            except Exception as exc:
-                st.error(f"Could not fetch listing page: {exc}")
-                st.stop()
-        elif "links" in st.session_state:
-            links = [PreviewLink(**item) for item in st.session_state["links"]]
-
+        listing_url = normalise_url(st.text_input("Tomorrow predictions URL", value=DEFAULT_TOMORROW_URL))
+        source = (mode, listing_url, int(max_previews))
     else:
         urls_raw = st.text_area(
             "Preview URLs, one per line",
             value="https://www.freesupertips.com/predictions/ghana-vs-panama-predictions-betting-tips-match-previews/",
             height=130,
         )
-        run = st.button("Fetch previews", type="primary")
-        if run:
-            links = [PreviewLink(url=normalise_url(x), link_text="") for x in urls_raw.splitlines() if x.strip()]
-            links = links[: int(max_previews)]
-            st.session_state["links"] = [asdict(x) for x in links]
-        elif "links" in st.session_state:
-            links = [PreviewLink(**item) for item in st.session_state["links"]]
+        urls = tuple(normalise_url(x) for x in urls_raw.splitlines() if x.strip())
+        source = (mode, urls, int(max_previews))
 
-    if not links:
+    run = st.button("Refresh previews" if snapshot else "Fetch previews", type="primary", key="fetch_previews")
+    if run:
+        links: List[PreviewLink] = []
+        errors: List[str] = []
+        try:
+            if mode == "Tomorrow page URL":
+                # Explicit fetch/refresh must bypass the cached HTML for this URL.
+                fetch_html.clear(listing_url)
+                listing_html = fetch_html(listing_url)
+                links = extract_preview_links(listing_url, listing_html)[: int(max_previews)]
+            else:
+                links = [PreviewLink(url=url, link_text="") for url in urls[: int(max_previews)]]
+        except Exception as exc:
+            st.error(f"Could not fetch listing page: {exc}. Any previous shortlist is retained.")
+        else:
+            if not links:
+                st.warning("No preview links found. Check the input; any previous shortlist is retained.")
+            else:
+                rows: List[TipRow] = []
+                progress = st.progress(0, text="Fetching preview pages...")
+                for i, link in enumerate(links, start=1):
+                    try:
+                        fetch_html.clear(link.url)
+                        preview_html = fetch_html(link.url)
+                        rows.extend(extract_tips_from_preview(link.url, preview_html, listing=link))
+                    except Exception as exc:
+                        errors.append(f"{link.url}: {exc}")
+                        rows.append(
+                            TipRow(
+                                date="",
+                                time="",
+                                match=link.listing_match,
+                                market="",
+                                market_type="",
+                                market_tags="",
+                                selection="",
+                                odds_when_tipped="",
+                                odds_decimal_from_tip=None,
+                                current_decimal_from_returns=None,
+                                reasoning="",
+                                url=link.url,
+                                status=f"Fetch error: {exc}",
+                            )
+                        )
+                    progress.progress(i / len(links), text=f"Fetched {i}/{len(links)} previews")
+                progress.empty()
+
+                # Publish the completed snapshot together so links, rows and errors agree.
+                snapshot = {
+                    "source": source,
+                    "links": [asdict(x) for x in links],
+                    "df": rows_to_dataframe(rows),
+                    "errors": errors,
+                    "fetched_at": datetime.now(UK_TZ).strftime("%d %b %Y, %H:%M %Z"),
+                }
+                st.session_state["compiled_snapshot"] = snapshot
+
+    if snapshot is None:
         st.info("Enter a URL and click **Fetch previews**.")
         st.stop()
 
+    # Filtering, editing and exports reuse these rows, even after the HTML cache expires.
+    links = [PreviewLink(**item) for item in snapshot["links"]]
+    df = snapshot["df"].copy()
+    errors = snapshot["errors"]
+    if source != snapshot["source"]:
+        st.info("Inputs have changed. Showing the previous shortlist until you click **Refresh previews**.")
+    st.caption(f"Last fetched: {snapshot['fetched_at']}. Filters use this shortlist; Refresh previews checks for updates.")
     with st.expander(f"Preview links found ({len(links)})", expanded=False):
-        st.dataframe(pd.DataFrame([asdict(x) for x in links]), use_container_width=True)
-
-    rows: List[TipRow] = []
-    progress = st.progress(0, text="Fetching preview pages...")
-    for i, link in enumerate(links, start=1):
-        try:
-            preview_html = fetch_html(link.url)
-            rows.extend(extract_tips_from_preview(link.url, preview_html, listing=link))
-        except Exception as exc:
-            errors.append(f"{link.url}: {exc}")
-            rows.append(
-                TipRow(
-                    date="",
-                    time="",
-                    match=link.listing_match,
-                    market="",
-                    market_type="",
-                    market_tags="",
-                    selection="",
-                    odds_when_tipped="",
-                    odds_decimal_from_tip=None,
-                    current_decimal_from_returns=None,
-                    reasoning="",
-                    url=link.url,
-                    status=f"Fetch error: {exc}",
-                )
-            )
-        progress.progress(i / len(links), text=f"Fetched {i}/{len(links)} previews")
-    progress.empty()
-
-    df = rows_to_dataframe(rows)
-    st.session_state["compiled_df"] = df
+        st.dataframe(pd.DataFrame(snapshot["links"]), use_container_width=True)
 
     ok_count = int((df["status"] == "OK").sum()) if not df.empty else 0
     st.success(f"Extracted {ok_count} usable tips from {len(links)} preview pages.")
@@ -1248,3 +1264,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
